@@ -1,0 +1,8 @@
+Dockerfile
+.dockerignore
+README.md
+AGENTS.md
+LICENSE
+.git
+.github
+.diploi

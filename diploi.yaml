@@ -1,0 +1,78 @@
+diploiVersion: v1.0
+type: component
+name: Metabase
+description: Official Diploi component for Metabase
+
+supportsAdditionalHosts: { serviceName: 'app' }
+
+hosts:
+  - name: Metabase
+    identifier: app
+    port: 3000
+
+images:
+  - identifier: app
+    prebuildImage: public.ecr.aws/p8t2q7f4/diploi/component-metabase:[tag]
+
+environmentVariables:
+  # Metabase's own application database on the PostgreSQL add-on, created on start
+  - identifier: MB_DB_TYPE
+    defaultValue: postgres
+  - identifier: MB_DB_DBNAME
+    defaultValue: metabase
+  - identifier: MB_SITE_URL
+    defaultValue: '${APP_ENDPOINT}'
+  # Encrypts the connection details of the databases Metabase queries. Never change it after the first start.
+  - identifier: MB_ENCRYPTION_SECRET_KEY
+    defaultValue: '${generate-random-bytes:32}'
+  # Signs session keys. Changing it logs everyone out.
+  - identifier: MB_SESSION_SECRET_KEY
+    defaultValue: '${generate-random-bytes:32}'
+  - identifier: MB_ANON_TRACKING_ENABLED
+    defaultValue: false
+  - identifier: MB_CHECK_FOR_UPDATES
+    defaultValue: false
+
+  # The admin user created on the first start. The trailing digit meets Metabase's password rule.
+  - identifier: INITIAL_ADMIN_EMAIL
+    defaultValue: admin@example.com
+  - identifier: INITIAL_ADMIN_PASSWORD
+    defaultValue: '${generate-random-password:16}0'
+  # The read-only role Metabase queries the connected database with, created on the first start
+  - identifier: READER_PASSWORD
+    defaultValue: '${generate-random-password:24}'
+
+  # The OAuth access token the prompt tab's agent reaches Metabase's MCP server with. The core adds it to the agent's
+  # requests, so it never reaches the development environment.
+  - identifier: METABASE_AGENT_TOKEN
+    defaultValue: '${generate-random-bytes:32}'
+
+  # Metabot through the Diploi AI proxy
+  - identifier: MB_LLM_ANTHROPIC_API_BASE_URL
+    defaultValue: '{diploi-ai-gateway-url}/anthropic'
+  - identifier: MB_LLM_ANTHROPIC_API_KEY
+    defaultValue: '{diploi-ai-gateway-token}'
+  - identifier: MB_LLM_METABOT_PROVIDER
+    defaultValue: anthropic/claude-sonnet-5-5
+  # Metabase 64 and 65 send temperature to Haiku 5.5, which it rejects. Switch to claude-haiku-5-5 once Metabase lists it.
+  - identifier: MB_LLM_MINI_MODEL
+    defaultValue: anthropic/claude-sonnet-5-5
+  # The proxy is on the deployment's private network, which Metabase refuses by default
+  - identifier: MB_LLM_ALLOWED_NETWORKS
+    defaultValue: allow-private
+
+mcp:
+  - url: 'http://app.${DIPLOI_NAMESPACE}:3000/api/metabase-mcp'
+    headers:
+      Authorization: 'Bearer ${METABASE_AGENT_TOKEN}'
+
+dependencies:
+  - identifier: postgres
+    package: https://github.com/diploi/addon-postgres#v18.3
+    env:
+      include:
+        - POSTGRES_HOST:MB_DB_HOST
+        - POSTGRES_PORT:MB_DB_PORT
+        - POSTGRES_USER:MB_DB_USER
+        - POSTGRES_PASSWORD:MB_DB_PASS
+        - POSTGRES_DB

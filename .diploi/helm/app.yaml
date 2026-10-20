@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  labels:
+    app: app
+spec:
+  selector:
+    matchLabels:
+      app: app
+  strategy:
+  {{- if eq .Values.stage "development"}}
+    type: Recreate
+  {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  {{- end }}
+  replicas: {{ ternary 1 0 .Values.enabled }}
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      terminationGracePeriodSeconds: 10
+      imagePullSecrets:
+        - name: diploi-pull-secret
+      containers:
+        - name: app
+          image: {{ .Values.images.app }}
+          imagePullPolicy: Always
+          command: ['/bin/bash', '/diploi/start.sh']
+          ports:
+            - containerPort: 3000
+          env:
+            {{- range .Values.env }}
+            - name: {{ .identifier }}
+              value: {{ .value | quote }}
+            {{- end }}
+          # The first start migrates the application database, which takes minutes on a small core
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            periodSeconds: 5
+            failureThreshold: 120
+          volumeMounts:
+            - name: scripts
+              mountPath: /diploi
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: app-scripts

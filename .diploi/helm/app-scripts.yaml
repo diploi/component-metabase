@@ -1,0 +1,201 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-scripts
+  labels:
+    app: app
+data:
+  start.sh: |
+    #!/bin/bash
+    # Creates Metabase's application database and starts Metabase. In the background, the first start creates the
+    # admin user and connects Metabase to Odoo's database, or else to the PostgreSQL add-on's database. Every start then
+    # makes sure the prompt tab's agent can use Metabase's MCP server with METABASE_AGENT_TOKEN.
+    set -eu
+
+    # On stderr, so that a log line inside $(...) still reaches the container log
+    log() {
+      echo "🟩 $(date -u +"%Y-%m-%dT%H:%M:%SZ") $1" >&2
+    }
+
+    # psql as the add-on's superuser. PG* variables are kept out of Metabase's own environment.
+    pg() {
+      PGPASSWORD="$MB_DB_PASS" psql -h "$MB_DB_HOST" -p "$MB_DB_PORT" -U "$MB_DB_USER" -X -q -v ON_ERROR_STOP=1 "$@"
+    }
+
+    BASE=http://127.0.0.1:3000
+    API=$BASE/api
+    READER="${MB_DB_DBNAME}_reader"
+    # The API key whose user the agent acts as, and the OAuth client its token is issued to
+    AGENT_NAME="Diploi agent"
+    # Every scope a tool of the MCP server asks for
+    AGENT_SCOPES='["agent:content:read", "agent:content:write", "agent:query:run", "agent:sql:run", "agent:delivery:write", "agent:resource:read"]'
+
+    # POST the JSON on stdin to Metabase and print the answer, or log Metabase's error
+    post() {
+      local response
+      if ! response=$(curl -sS --fail-with-body -H 'Content-Type: application/json' --data @- "$@"); then
+        log "Metabase refused the request: $response"
+        return 1
+      fi
+      echo "$response"
+    }
+
+    # Sets SOURCE_NAME and SOURCE_DB: the first database with Odoo's tables, or the add-on's own database
+    find_source_database() {
+      local databases db
+      databases=$(pg -d postgres -tA -v app_db="$MB_DB_DBNAME" <<'SQL'
+    SELECT datname FROM pg_database
+    WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('postgres', :'app_db')
+    ORDER BY datname
+    SQL
+      )
+      while read -r db; do
+        if [ -n "$db" ] && [ "$(pg -d "$db" -tAc "SELECT to_regclass('public.ir_module_module') IS NOT NULL")" = t ]; then
+          SOURCE_NAME=Odoo
+          SOURCE_DB=$db
+          return
+        fi
+      done <<<"$databases"
+      SOURCE_NAME=PostgreSQL
+      SOURCE_DB=$POSTGRES_DB
+    }
+
+    # A login role that can read every table in SOURCE_DB, also the ones its owner creates later
+    create_reader() {
+      pg -d postgres -v role="$READER" -v password="$READER_PASSWORD" -v db="$SOURCE_DB" <<'SQL'
+    SELECT format('CREATE ROLE %I', :'role') WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role')
+    \gexec
+    SELECT format('ALTER ROLE %I WITH LOGIN NOSUPERUSER PASSWORD %L', :'role', :'password')
+    \gexec
+    SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db', :'role')
+    \gexec
+    SQL
+      pg -d "$SOURCE_DB" -v role="$READER" <<'SQL'
+    SELECT format('GRANT USAGE ON SCHEMA %I TO %I', nspname, :'role')
+    FROM pg_namespace WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema'
+    \gexec
+    SELECT format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO %I', nspname, :'role')
+    FROM pg_namespace WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema'
+    \gexec
+    SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT SELECT ON TABLES TO %I', pg_get_userbyid(datdba), :'role')
+    FROM pg_database WHERE datname = current_database()
+    \gexec
+    SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT USAGE ON SCHEMAS TO %I', pg_get_userbyid(datdba), :'role')
+    FROM pg_database WHERE datname = current_database()
+    \gexec
+    SQL
+    }
+
+    first_run_setup() {
+      local properties=$1 session group
+      find_source_database
+      log "First start: creating the admin user $INITIAL_ADMIN_EMAIL and connecting the $SOURCE_NAME database $SOURCE_DB"
+      create_reader
+
+      session=$(
+        jq -n \
+          --arg token "$(jq -r '."setup-token"' <<<"$properties")" \
+          --arg email "$INITIAL_ADMIN_EMAIL" \
+          --arg password "$INITIAL_ADMIN_PASSWORD" \
+          '{token: $token, user: {first_name: "Admin", email: $email, password: $password}, prefs: {site_name: "Metabase"}}' |
+          post "$API/setup" |
+          jq -r .id
+      )
+
+      jq -n \
+        --arg name "$SOURCE_NAME" \
+        --arg host "$MB_DB_HOST" \
+        --argjson port "$MB_DB_PORT" \
+        --arg dbname "$SOURCE_DB" \
+        --arg user "$READER" \
+        --arg password "$READER_PASSWORD" \
+        '{engine: "postgres", name: $name, details: {host: $host, port: $port, dbname: $dbname, user: $user, password: $password, ssl: false}}' |
+        post -H "X-Metabase-Session: $session" "$API/database" >/dev/null
+
+      # The key gives the agent a user of its own in the Administrators group. Nothing uses the key's value.
+      group=$(curl -sSf -H "X-Metabase-Session: $session" "$API/permissions/group" | jq '.[] | select(.name == "Administrators") | .id')
+      jq -n --arg name "$AGENT_NAME" --argjson group_id "$group" '{name: $name, group_id: $group_id}' |
+        post -H "X-Metabase-Session: $session" "$API/api-key" >/dev/null
+
+      log "First start setup done"
+    }
+
+    # Gives the user of the API key "Diploi agent" an OAuth access token for the MCP server with the value
+    # METABASE_AGENT_TOKEN, and revokes the client's other tokens. Metabase issues no token that lasts, so this one is
+    # written to its database: Metabase stores the SHA-256 of a token, base64url without padding.
+    grant_agent_token() {
+      local token=${METABASE_AGENT_TOKEN:-} user client changed
+      if [ ${#token} -lt 32 ]; then
+        log "METABASE_AGENT_TOKEN is shorter than 32 characters, so the prompt tab cannot use Metabase"
+        return
+      fi
+
+      user=$(pg -d "$MB_DB_DBNAME" -tA -v name="$AGENT_NAME" <<'SQL'
+    SELECT u.id FROM api_key k JOIN core_user u ON u.id = k.user_id WHERE k.name = :'name' AND u.is_active
+    SQL
+      )
+      if [ -z "$user" ]; then
+        log "There is no API key named \"$AGENT_NAME\", so the prompt tab cannot use Metabase. See README.md"
+        return
+      fi
+
+      client=$(pg -d "$MB_DB_DBNAME" -tA -v name="$AGENT_NAME" <<'SQL'
+    SELECT client_id FROM oauth_client WHERE client_name = :'name' ORDER BY id LIMIT 1
+    SQL
+      )
+      if [ -z "$client" ]; then
+        client=$(
+          jq -n --arg name "$AGENT_NAME" --argjson scopes "$AGENT_SCOPES" \
+            '{client_name: $name, redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code"], response_types: ["code"], token_endpoint_auth_method: "none", scope: ($scopes | join(" "))}' |
+            post "$BASE/oauth/register" |
+            jq -r .client_id
+        )
+      fi
+
+      changed=$(pg -d "$MB_DB_DBNAME" -tA -v token="$token" -v user="$user" -v client="$client" -v scopes="$AGENT_SCOPES" <<'SQL'
+    WITH hashed AS (
+      SELECT rtrim(translate(encode(sha256(convert_to(:'token', 'UTF8')), 'base64'), '+/', '-_'), '=') AS token
+    ), revoked AS (
+      UPDATE oauth_access_token SET revoked_at = now()
+      WHERE client_id = :'client' AND revoked_at IS NULL AND token <> (SELECT token FROM hashed)
+    )
+    -- Expires in the year 2100: Metabase requires an expiry, in milliseconds
+    INSERT INTO oauth_access_token (token, user_id, client_id, scope, expiry)
+    SELECT token, :'user'::int, :'client', :'scopes', 4102444800000 FROM hashed
+    ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, client_id = EXCLUDED.client_id,
+      scope = EXCLUDED.scope, expiry = EXCLUDED.expiry, revoked_at = NULL
+    WHERE oauth_access_token.revoked_at IS NOT NULL OR oauth_access_token.user_id <> EXCLUDED.user_id
+      OR oauth_access_token.client_id <> EXCLUDED.client_id
+    RETURNING 'changed'
+    SQL
+      )
+      [ -z "$changed" ] || log "Gave the prompt tab's agent access to Metabase's MCP server"
+    }
+
+    agent_setup() {
+      until curl -sf "$API/health" >/dev/null; do sleep 5; done
+
+      local properties
+      properties=$(curl -sSf "$API/session/properties")
+      if [ "$(jq -r '."has-user-setup"' <<<"$properties")" != true ]; then
+        first_run_setup "$properties"
+      fi
+      grant_agent_token
+    }
+
+    log "Waiting for PostgreSQL"
+    until pg -d postgres -c 'SELECT 1' >/dev/null 2>&1; do sleep 2; done
+
+    pg -d postgres -v db="$MB_DB_DBNAME" <<'SQL'
+    SELECT format('CREATE DATABASE %I', :'db') WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db')
+    \gexec
+    SQL
+
+    (
+      set -eo pipefail
+      trap '[ $? -eq 0 ] || log "Setting Metabase up failed, see README.md"' EXIT
+      agent_setup
+    ) &
+
+    log "Starting Metabase"
+    exec /app/run_metabase.sh
