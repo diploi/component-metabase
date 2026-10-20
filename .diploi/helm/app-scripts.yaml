@@ -5,12 +5,17 @@ metadata:
   labels:
     app: app
 data:
-  start.sh: |
-    #!/bin/bash
-    # Creates Metabase's application database and starts Metabase. In the background, the first start creates the
-    # admin user and connects Metabase to Odoo's database, or else to the PostgreSQL add-on's database. Every start then
-    # makes sure the prompt tab's agent can use Metabase's MCP server with METABASE_AGENT_TOKEN.
+  setup.sh: |
+    #!/bin/sh
+    # Runs beside Metabase, in the pod's setup container. Creates Metabase's application database, which Metabase waits
+    # for, and on the first start creates the admin user and connects Metabase to Odoo's database, or else to the
+    # PostgreSQL add-on's database. Every start then gives the prompt tab's agent access to Metabase's MCP server with
+    # METABASE_AGENT_TOKEN, or takes it away. The container is a plain Alpine, so the tools are installed first.
     set -eu
+    if [ -z "${BASH_VERSION:-}" ]; then
+      apk add --no-cache bash postgresql-client jq curl >/dev/null
+      exec bash "$0" "$@"
+    fi
 
     # On stderr, so that a log line inside $(...) still reaches the container log
     log() {
@@ -22,6 +27,7 @@ data:
       PGPASSWORD="$MB_DB_PASS" psql -h "$MB_DB_HOST" -p "$MB_DB_PORT" -U "$MB_DB_USER" -X -q -v ON_ERROR_STOP=1 "$@"
     }
 
+    # Metabase, in the same pod
     BASE=http://127.0.0.1:3000
     API=$BASE/api
     READER="${MB_DB_DBNAME}_reader"
@@ -172,6 +178,18 @@ data:
       [ -z "$changed" ] || log "Gave the prompt tab's agent access to Metabase's MCP server"
     }
 
+    # Revokes the agent's tokens, for a deployment that has the prompt tab's access switched off
+    revoke_agent_tokens() {
+      local revoked
+      revoked=$(pg -d "$MB_DB_DBNAME" -tA -v name="$AGENT_NAME" <<'SQL'
+    UPDATE oauth_access_token SET revoked_at = now()
+    WHERE revoked_at IS NULL AND client_id IN (SELECT client_id FROM oauth_client WHERE client_name = :'name')
+    RETURNING 'revoked'
+    SQL
+      )
+      [ -z "$revoked" ] || log "Took the prompt tab's agent's access to Metabase's MCP server away"
+    }
+
     agent_setup() {
       until curl -sf "$API/health" >/dev/null; do sleep 5; done
 
@@ -180,7 +198,11 @@ data:
       if [ "$(jq -r '."has-user-setup"' <<<"$properties")" != true ]; then
         first_run_setup "$properties"
       fi
-      grant_agent_token
+      if [ "${DIPLOI_AGENT_ENABLED:-true}" = true ]; then
+        grant_agent_token
+      else
+        revoke_agent_tokens
+      fi
     }
 
     log "Waiting for PostgreSQL"
@@ -190,12 +212,17 @@ data:
     SELECT format('CREATE DATABASE %I', :'db') WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db')
     \gexec
     SQL
+    touch /diploi-state/database-ready
+    log "Database ready, Metabase starts"
 
     (
       set -eo pipefail
       trap '[ $? -eq 0 ] || log "Setting Metabase up failed, see README.md"' EXIT
       agent_setup
-    ) &
+    ) || true
 
-    log "Starting Metabase"
-    exec /app/run_metabase.sh
+    # Waits as PID 1, which only a trap can stop: a kubectl delete or a rolling update sends TERM
+    log "Setup done"
+    trap 'exit 0' TERM
+    sleep infinity &
+    wait $!

@@ -30,7 +30,8 @@ spec:
         - name: app
           image: {{ .Values.images.app }}
           imagePullPolicy: Always
-          command: ['/bin/bash', '/diploi/start.sh']
+          # Metabase needs its database, which the setup container creates
+          command: ['/bin/bash', '-c', 'until [ -f /diploi-state/database-ready ]; do sleep 1; done; exec /app/run_metabase.sh']
           ports:
             - containerPort: 3000
           env:
@@ -46,10 +47,27 @@ spec:
             periodSeconds: 5
             failureThreshold: 120
           volumeMounts:
+            - name: state
+              mountPath: /diploi-state
+        # Creates the database, sets Metabase up on its first start and gives the prompt tab's agent access, then waits
+        - name: setup
+          image: alpine:3.22
+          imagePullPolicy: IfNotPresent
+          command: ['/bin/sh', '/diploi/setup.sh']
+          env:
+            {{- range .Values.env }}
+            - name: {{ .identifier }}
+              value: {{ .value | quote }}
+            {{- end }}
+          volumeMounts:
             - name: scripts
               mountPath: /diploi
               readOnly: true
+            - name: state
+              mountPath: /diploi-state
       volumes:
         - name: scripts
           configMap:
             name: app-scripts
+        - name: state
+          emptyDir: {}
