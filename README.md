@@ -41,7 +41,7 @@ A `setup` container runs beside Metabase in its pod. On every start it creates M
 4. Creates the `metabase_reader` role, which can read every table in that database but change nothing. Metabase queries the database as this role. Tables the database's owner creates later are readable too, such as those of a new Odoo module.
 5. Creates the API key `Diploi agent` in the Administrators group, which gives the prompt tab's agent a Metabase user of its own. See [Prompt tab](#prompt-tab).
 
-Later starts skip steps 2 to 5. The script lives in the component's helm files (`.diploi/helm/app-scripts.yaml`), so it is updated with the component rather than being frozen in the user project. The `setup` container is a plain Alpine that installs `psql`, `jq` and `curl` when it starts, which takes a few seconds.
+Later starts skip steps 2 to 5. The script comes with the component, so it is updated with the component rather than being frozen in the user project. The `setup` container is a plain Alpine that installs `psql`, `jq` and `curl` when it starts, which takes a few seconds.
 
 If the setup fails, the `setup` container's log says why. Finish it in the browser: Metabase shows its setup wizard while there is no admin user, and databases are added in **Admin > Databases**.
 
